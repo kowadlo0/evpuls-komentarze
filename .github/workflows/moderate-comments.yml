@@ -1,0 +1,90 @@
+name: Auto-Moderacja Komentarzy Giscus (EVpuls)
+
+on:
+  discussion_comment:
+    types: [created, edited]
+
+permissions:
+  discussions: write
+
+jobs:
+  moderate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sprawdź i ukryj spam / nadużycia
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMENT_NODE_ID: ${{ github.event.comment.node_id }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+        run: |
+          node -e '
+            const body = (process.env.COMMENT_BODY || "").trim();
+            const nodeId = process.env.COMMENT_NODE_ID;
+            const ghToken = process.env.GITHUB_TOKEN;
+            const geminiKey = process.env.GEMINI_API_KEY;
+
+            async function minimize(classifier) {
+              const query = `mutation($id: ID!, $classifier: ReportedContentClassifiers!) {
+                minimizeComment(input: { subjectId: $id, classifier: $classifier }) {
+                  minimizedComment { isMinimized }
+                }
+              }`;
+              const res = await fetch("https://api.github.com/graphql", {
+                method: "POST",
+                headers: {
+                  Authorization: "Bearer " + ghToken,
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ query, variables: { id: nodeId, classifier } }),
+              });
+              console.log("Ukryto komentarz (" + classifier + "):", res.status);
+            }
+
+            (async () => {
+              // 1. Twardy filtr antyspamowy (0 ms): >2 linki lub typowy spam krypto/kasyn
+              const urlCount = (body.match(/https?:\/\//gi) || []).length;
+              if (urlCount > 2 || /(casino|crypto\s*signal|whatsapp\s*\+|telegram\s*@|viagra|porn)/i.test(body)) {
+                await minimize("SPAM");
+                return;
+              }
+
+              if (!geminiKey) {
+                console.log("Brak GEMINI_API_KEY — zakończono po twardych regułach.");
+                return;
+              }
+
+              // 2. Klasyfikator AI (darmowe Gemini Flash)
+              const prompt = `Jesteś moderatorem komentarzy na polskim portalu o autach elektrycznych EVpuls.
+Oceń poniższy komentarz. Ostre spory o marki (np. Tesla vs BYD) są DOZWOLONE.
+Zwróć JEDNO słowo:
+- OK (normalny komentarz lub krytyka)
+- SPAM (reklama, linki SEO, bot, scam)
+- ABUSE (wulgaryzmy w stronę osób, groźby, mowa nienawiści, publikacja prywatnych danych osobowych)
+
+Komentarz:
+${body.slice(0, 2000)}`;
+
+              const res = await fetch(
+                `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`,
+                {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    contents: [{ parts: [{ text: prompt }] }],
+                    generationConfig: { temperature: 0 },
+                  }),
+                }
+              );
+              const data = await res.json();
+              const verdict = (data?.candidates?.[0]?.content?.parts?.[0]?.text || "OK").trim().toUpperCase();
+              console.log("Werdykt AI:", verdict);
+
+              if (verdict.includes("SPAM")) await minimize("SPAM");
+              else if (verdict.includes("ABUSE")) await minimize("ABUSE");
+            })().catch((e) => {
+              console.error(e);
+              process.exit(0);
+            });
+          '
