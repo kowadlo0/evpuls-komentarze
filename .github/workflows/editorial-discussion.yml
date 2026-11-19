@@ -1,0 +1,140 @@
+name: Redakcyjne pytania do dyskusji (EVpuls)
+
+on:
+  schedule:
+    # Raz dziennie o 10:00 UTC (11:00 PL)
+    - cron: '0 10 * * *'
+  workflow_dispatch:
+
+permissions:
+  discussions: write
+
+jobs:
+  seed-discussion:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Otwórz jawne pytanie redakcyjne pod wybranym nowym artykułem
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_ID: R_kgDOV0m15g
+          CATEGORY_ID: DIC_kwDOV0m15s4DLg5A
+          RSS_URL: https://www.evpuls.pl/rss.xml
+        run: |
+          node -e '
+            const ghToken = process.env.GITHUB_TOKEN;
+            const geminiKey = process.env.GEMINI_API_KEY;
+            const repoId = process.env.REPO_ID;
+            const categoryId = process.env.CATEGORY_ID;
+            const rssUrl = process.env.RSS_URL;
+
+            async function gql(query, variables = {}) {
+              const res = await fetch("https://api.github.com/graphql", {
+                method: "POST",
+                headers: {
+                  Authorization: "Bearer " + ghToken,
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ query, variables }),
+              });
+              const json = await res.json();
+              if (json.errors) throw new Error(JSON.stringify(json.errors));
+              return json.data;
+            }
+
+            (async () => {
+              const rssRes = await fetch(rssUrl, { signal: AbortSignal.timeout(15000) });
+              if (!rssRes.ok) throw new Error("RSS HTTP " + rssRes.status);
+              const xml = await rssRes.text();
+
+              // Prosty parser <item> z RSS
+              const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].map((m) => {
+                const block = m[1];
+                const get = (tag) =>
+                  (block.match(new RegExp(`<${tag}>(?:<!\\[CDATA\\[)?([\\s\\S]*?)(?:\\]\\]>)?<\\/${tag}>`))?.[1] || "").trim();
+                const link = get("link");
+                let pathname = "";
+                try { pathname = new URL(link).pathname; } catch {}
+                return { title: get("title"), description: get("description"), link, pathname };
+              }).filter((x) => x.pathname.startsWith("/news/"));
+
+              if (!items.length) {
+                console.log("Brak artykułów w RSS.");
+                return;
+              }
+
+              // Pobierz istniejące dyskusje, żeby nie dublować wątków
+              const existingData = await gql(`
+                query {
+                  repository(owner: "kowadlo0", name: "evpuls-komentarze") {
+                    discussions(first: 100, orderBy: { field: CREATED_AT, direction: DESC }) {
+                      nodes { title }
+                    }
+                  }
+                }
+              `);
+              const existingTitles = new Set(
+                (existingData?.repository?.discussions?.nodes || []).map((d) => d.title.trim())
+              );
+
+              // Wybierz co 2. artykuł, który nie ma jeszcze wątku (maks. 1 na uruchomienie)
+              const candidate = items.find((item, idx) => idx % 2 === 0 && !existingTitles.has(item.pathname));
+              if (!candidate) {
+                console.log("Brak nowego kwalifikującego się artykułu do otwarcia dyskusji.");
+                return;
+              }
+
+              let question = "Jak oceniacie ten temat z perspektywy polskiego kierowcy EV? Dajcie znać w komentarzach!";
+              if (geminiKey) {
+                const prompt = `Jesteś redaktorem polskiego portalu motoryzacyjnego EVpuls.pl.
+Napisz JEDNO krótkie, naturalne, merytoryczne pytanie otwierające dyskusję pod tym artykułem (maks. 2 zdania, po polsku, bez hasztagów).
+Tytuł: ${candidate.title}
+Opis: ${candidate.description}`;
+                try {
+                  const aiRes = await fetch(
+                    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`,
+                    {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({
+                        contents: [{ parts: [{ text: prompt }] }],
+                        generationConfig: { temperature: 0.7 },
+                      }),
+                    }
+                  );
+                  const aiData = await aiRes.json();
+                  const text = aiData?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+                  if (text && text.length > 15 && text.length < 400) question = text;
+                } catch (e) {
+                  console.warn("Fallback pytania (błąd Gemini):", e.message);
+                }
+              }
+
+              const discBody = `# ${candidate.title}\n\n${candidate.description}\n\n${candidate.link}`;
+              const created = await gql(
+                `mutation($repoId: ID!, $catId: ID!, $title: String!, $body: String!) {
+                  createDiscussion(input: { repositoryId: $repoId, categoryId: $catId, title: $title, body: $body }) {
+                    discussion { id url }
+                  }
+                }`,
+                { repoId, catId: categoryId, title: candidate.pathname, body: discBody }
+              );
+
+              const discId = created.createDiscussion.discussion.id;
+              const commentBody = `💬 **Pytanie od redakcji EVpuls:**\n\n${question}`;
+              await gql(
+                `mutation($discId: ID!, $body: String!) {
+                  addDiscussionComment(input: { discussionId: $discId, body: $body }) {
+                    comment { id }
+                  }
+                }`,
+                { discId, body: commentBody }
+              );
+
+              console.log("Utworzono jawne pytanie redakcyjne dla:", candidate.pathname, "->", created.createDiscussion.discussion.url);
+            })().catch((e) => {
+              console.error(e);
+              process.exit(1);
+            });
+          '
